@@ -25,7 +25,7 @@ let package = Package(
         .trait(name: "CoreML"),
         .trait(name: "MLX"),
         .trait(name: "Llama"),
-        .default(enabledTraits: []),
+        .default(enabledTraits: ["MLX"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),

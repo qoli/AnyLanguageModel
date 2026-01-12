@@ -34,24 +34,35 @@ extension URLSession {
             request.addValue("application/json", forHTTPHeaderField: "Content-Type")
         }
 
-        let (data, response) = try await data(for: request)
+        debugLogRequest(request)
+
+        let (responseData, response): (Data, URLResponse)
+        do {
+            (responseData, response) = try await self.data(for: request)
+        } catch {
+            debugLogError(error, request: request)
+            throw error
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
+            debugLogInvalidResponse(response, request: request)
             throw URLSessionError.invalidResponse
         }
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = dateDecodingStrategy
 
+        debugLogResponse(httpResponse, data: responseData, request: request)
+
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
-            if let errorString = String(data: data, encoding: .utf8) {
+            if let errorString = String(data: responseData, encoding: .utf8) {
                 throw URLSessionError.httpError(statusCode: httpResponse.statusCode, detail: errorString)
             }
             throw URLSessionError.httpError(statusCode: httpResponse.statusCode, detail: "Invalid response")
         }
 
         do {
-            return try decoder.decode(T.self, from: data)
+            return try decoder.decode(T.self, from: responseData)
         } catch {
             throw URLSessionError.decodingError(detail: error.localizedDescription)
         }
@@ -83,20 +94,31 @@ extension URLSession {
                         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
                     }
 
-                    let (data, response) = try await self.data(for: request)
+                    debugLogRequest(request)
+
+                    let (responseData, response): (Data, URLResponse)
+                    do {
+                        (responseData, response) = try await self.data(for: request)
+                    } catch {
+                        debugLogError(error, request: request)
+                        throw error
+                    }
 
                     guard let httpResponse = response as? HTTPURLResponse else {
+                        debugLogInvalidResponse(response, request: request)
                         throw URLSessionError.invalidResponse
                     }
 
+                    debugLogResponse(httpResponse, data: responseData, request: request)
+
                     guard (200 ..< 300).contains(httpResponse.statusCode) else {
-                        if let errorString = String(data: data, encoding: .utf8) {
+                        if let errorString = String(data: responseData, encoding: .utf8) {
                             throw URLSessionError.httpError(statusCode: httpResponse.statusCode, detail: errorString)
                         }
                         throw URLSessionError.httpError(statusCode: httpResponse.statusCode, detail: "Invalid response")
                     }
 
-                    var buffer = data
+                    var buffer = responseData
 
                     while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
                         let chunk = buffer[..<newlineIndex]
@@ -142,15 +164,34 @@ extension URLSession {
                         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
                     }
 
+                    debugLogRequest(request)
+
                     #if canImport(FoundationNetworking)
-                        let (asyncBytes, response) = try await self.linuxBytes(for: request)
+                        let asyncBytes: AsyncThrowingStream<UInt8, Error>
+                        let response: URLResponse
+                        do {
+                            (asyncBytes, response) = try await self.linuxBytes(for: request)
+                        } catch {
+                            debugLogError(error, request: request)
+                            throw error
+                        }
                     #else
-                        let (asyncBytes, response) = try await self.bytes(for: request)
+                        let asyncBytes: URLSession.AsyncBytes
+                        let response: URLResponse
+                        do {
+                            (asyncBytes, response) = try await self.bytes(for: request)
+                        } catch {
+                            debugLogError(error, request: request)
+                            throw error
+                        }
                     #endif
 
                     guard let httpResponse = response as? HTTPURLResponse else {
+                        debugLogInvalidResponse(response, request: request)
                         throw URLSessionError.invalidResponse
                     }
+
+                    debugLogResponse(httpResponse, data: nil, request: request)
 
                     guard (200 ..< 300).contains(httpResponse.statusCode) else {
                         var errorData = Data()
@@ -312,4 +353,60 @@ enum URLSessionError: Error, CustomStringConvertible {
             return "Decoding error: \(detail)"
         }
     }
+}
+
+private func debugLogRequest(_ request: URLRequest) {
+    #if DEBUG
+    guard let url = request.url else { return }
+    let method = request.httpMethod ?? "GET"
+    let headers = debugRedactedHeaders(request.allHTTPHeaderFields ?? [:])
+    let bodyCount = request.httpBody?.count ?? 0
+    print("[AnyLanguageModel][HTTP] request method=\(method) url=\(url.absoluteString) headers=\(headers) bodyBytes=\(bodyCount)")
+    #endif
+}
+
+private func debugLogResponse(_ response: HTTPURLResponse, data: Data?, request: URLRequest) {
+    #if DEBUG
+    let url = request.url?.absoluteString ?? "unknown"
+    let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? "unknown"
+    let length = data?.count ?? 0
+    print("[AnyLanguageModel][HTTP] response url=\(url) status=\(response.statusCode) contentType=\(contentType) bodyBytes=\(length)")
+    #endif
+}
+
+private func debugLogInvalidResponse(_ response: URLResponse, request: URLRequest) {
+    #if DEBUG
+    let url = request.url?.absoluteString ?? "unknown"
+    print("[AnyLanguageModel][HTTP] invalid response url=\(url) type=\(type(of: response))")
+    #endif
+}
+
+private func debugLogError(_ error: Error, request: URLRequest) {
+    #if DEBUG
+    let url = request.url?.absoluteString ?? "unknown"
+    print("[AnyLanguageModel][HTTP] error url=\(url) error=\(error)")
+    #endif
+}
+
+private func debugRedactedHeaders(_ headers: [String: String]) -> [String: String] {
+    #if DEBUG
+    let sensitiveKeys = [
+        "authorization",
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        "anthropic-api-key"
+    ]
+    var redacted: [String: String] = [:]
+    for (key, value) in headers {
+        if sensitiveKeys.contains(key.lowercased()) {
+            redacted[key] = "<redacted>"
+        } else {
+            redacted[key] = value
+        }
+    }
+    return redacted
+    #else
+    return [:]
+    #endif
 }

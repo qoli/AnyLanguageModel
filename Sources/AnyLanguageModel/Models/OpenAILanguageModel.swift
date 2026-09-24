@@ -479,7 +479,7 @@ public struct OpenAILanguageModel: LanguageModel {
         switch apiVariant {
         case .chatCompletions:
             return try await respondWithChatCompletions(
-                messages: session.transcript.toOpenAIMessages(),
+                messages: try session.transcript.toOpenAIMessages(),
                 tools: openAITools,
                 generating: type,
                 schema: schema,
@@ -488,7 +488,7 @@ public struct OpenAILanguageModel: LanguageModel {
             )
         case .responses:
             return try await respondWithResponses(
-                messages: session.transcript.toOpenAIMessages(),
+                messages: try session.transcript.toOpenAIMessages(),
                 tools: openAITools,
                 generating: type,
                 schema: schema,
@@ -771,7 +771,7 @@ public struct OpenAILanguageModel: LanguageModel {
             continuation in
             let task = Task {
                 do {
-                    var messages = session.transcript.toOpenAIMessages()
+                    var messages = try session.transcript.toOpenAIMessages()
                     var state = StreamingResponseState<Content>()
                     var toolRounds = ToolRoundLimit(provider: "OpenAI")
                     while true {
@@ -1301,7 +1301,7 @@ private enum Responses {
 // MARK: - Supporting Types
 
 extension Transcript {
-    fileprivate func toOpenAIMessages() -> [OpenAIMessage] {
+    fileprivate func toOpenAIMessages() throws -> [OpenAIMessage] {
         var messages = [OpenAIMessage]()
         for item in self {
             switch item {
@@ -1319,6 +1319,8 @@ extension Transcript {
                         content: .blocks(convertSegmentsToOpenAIBlocks(prompt.segments))
                     )
                 )
+            case .reasoning:
+                throw Transcript.ReasoningReplayError.unsupportedProvider("OpenAILanguageModel")
             case .response(let response):
                 messages.append(
                     .init(

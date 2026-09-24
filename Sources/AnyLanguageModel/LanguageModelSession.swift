@@ -1,11 +1,26 @@
 import Foundation
 import Observation
 
+/// Controls transcript retention when generation fails or is cancelled.
+public enum TranscriptErrorHandlingPolicy: Sendable, Equatable {
+    /// Retain the prompt and the latest cumulative streaming checkpoint.
+    /// Nonstreaming failures have no checkpoint and retain only the prompt.
+    case preserveTranscript
+    /// Restore the transcript as it was before the request. Tool side effects are not undone.
+    case revertTranscript
+}
+
 @Observable
 public final class LanguageModelSession: @unchecked Sendable {
     public var isResponding: Bool {
         access(keyPath: \.isResponding)
         return state.withLock { $0.isResponding }
+    }
+
+    /// `nil` retains the existing failure behavior (the prompt remains).
+    public var transcriptErrorHandlingPolicy: TranscriptErrorHandlingPolicy? {
+        get { state.withLock { $0.transcriptErrorHandlingPolicy } }
+        set { state.withLock { $0.transcriptErrorHandlingPolicy = newValue } }
     }
 
     public var transcript: Transcript {
@@ -23,6 +38,16 @@ public final class LanguageModelSession: @unchecked Sendable {
     }
 
     @ObservationIgnored private let state: Locked<State>
+    @ObservationIgnored private let responseRelay = Locked<Task<Void, Never>?>(nil)
+
+    /// Waits for the current streaming response relay to finish transcript cleanup.
+    /// Call after cancelling a consumer, before persisting the transcript or starting
+    /// another response. This synchronization API is an AnyLanguageModel extension.
+    /// Do not call from a tool executing within the same response.
+    nonisolated public func waitForResponseCompletion() async {
+        let task = responseRelay.withLock { $0 }
+        await task?.value
+    }
 
     private let model: any LanguageModel
     public let tools: [any Tool]
@@ -141,12 +166,16 @@ public final class LanguageModelSession: @unchecked Sendable {
     }
 
     nonisolated private func wrapRespond<T>(_ operation: () async throws -> T) async throws -> T {
+        let initialTranscript = transcript
         beginResponding()
         do {
             let result = try await operation()
             endResponding()
             return result
         } catch {
+            if transcriptErrorHandlingPolicy == .revertTranscript {
+                withMutation(keyPath: \.transcript) { state.withLock { $0.transcript = initialTranscript } }
+            }
             endResponding()
             throw error
         }
@@ -204,10 +233,25 @@ public final class LanguageModelSession: @unchecked Sendable {
                     session.endResponding()
                     continuation.finish()
                 } catch {
+                    session.withMutation(keyPath: \.transcript) {
+                        session.state.withLock { state in
+                            switch state.transcriptErrorHandlingPolicy {
+                            case .preserveTranscript:
+                                state.transcript.append(contentsOf: lastSnapshot?.transcriptEntries ?? [])
+                            case .revertTranscript:
+                                state.transcript = Transcript(
+                                    entries: state.transcript.prefix { $0.id != promptEntry.id }
+                                )
+                            case nil:
+                                break
+                            }
+                        }
+                    }
                     session.endResponding()
                     continuation.finish(throwing: error)
                 }
             }
+            session.responseRelay.withLock { $0 = task }
             continuation.onTermination = { termination in
                 if case .cancelled = termination {
                     task.cancel()
@@ -347,11 +391,6 @@ public final class LanguageModelSession: @unchecked Sendable {
         /// with zero counts for values the provider does not report.
         public let usage: Usage
 
-        /// Provider-exposed reasoning text accumulated across this generation, including tool rounds.
-        /// This optional AnyLanguageModel extension is for display only, may be a summary,
-        /// and is not added to the transcript or used to replay provider state.
-        public let reasoning: String?
-
         internal let providerMetadata: [String: String]?
 
         /// Creates a response value from generated content and transcript entries.
@@ -359,7 +398,7 @@ public final class LanguageModelSession: @unchecked Sendable {
         ///   - content: The decoded response content.
         ///   - rawContent: The raw content produced by the model.
         ///   - transcriptEntries: Transcript entries associated with the response.
-        ///   - reasoning: Optional cumulative provider-exposed reasoning for display.
+
         ///   - usage: Provider-reported token usage.
         public init(
             content: Content,
@@ -368,16 +407,14 @@ public final class LanguageModelSession: @unchecked Sendable {
             usage: Usage = .init(
                 input: .init(totalTokenCount: 0, cachedTokenCount: 0),
                 output: .init(totalTokenCount: 0, reasoningTokenCount: 0)
-            ),
-            reasoning: String? = nil
+            )
         ) {
             self.init(
                 content: content,
                 rawContent: rawContent,
                 transcriptEntries: transcriptEntries,
                 usage: usage,
-                providerMetadata: nil,
-                reasoning: reasoning
+                providerMetadata: nil
             )
         }
 
@@ -389,14 +426,13 @@ public final class LanguageModelSession: @unchecked Sendable {
                 input: .init(totalTokenCount: 0, cachedTokenCount: 0),
                 output: .init(totalTokenCount: 0, reasoningTokenCount: 0)
             ),
-            providerMetadata: [String: String]?,
-            reasoning: String? = nil
+            providerMetadata: [String: String]?
         ) {
             self.content = content
             self.rawContent = rawContent
             self.transcriptEntries = transcriptEntries
             self.usage = usage
-            self.reasoning = reasoning
+
             self.providerMetadata = providerMetadata
         }
     }
@@ -1062,7 +1098,7 @@ extension LanguageModelSession {
         /// - Parameters:
         ///   - content: The complete response content.
         ///   - rawContent: The raw content produced by the model.
-        ///   - reasoning: Optional cumulative provider-exposed reasoning for display.
+
         ///   - usage: Provider-reported token usage.
         public init(
             content: Content,
@@ -1070,14 +1106,12 @@ extension LanguageModelSession {
             usage: Usage = .init(
                 input: .init(totalTokenCount: 0, cachedTokenCount: 0),
                 output: .init(totalTokenCount: 0, reasoningTokenCount: 0)
-            ),
-            reasoning: String? = nil
+            )
         ) {
             self.fallbackSnapshot = Snapshot(
                 content: content.asPartiallyGenerated(),
                 rawContent: rawContent,
-                usage: usage,
-                reasoning: reasoning
+                usage: usage
             )
             self.streaming = nil
         }
@@ -1111,11 +1145,6 @@ extension LanguageModelSession {
             /// with zero counts for values the provider does not report.
             public var usage: Usage
 
-            /// Provider-exposed reasoning text accumulated so far across this generation,
-            /// including tool rounds. This display-only AnyLanguageModel extension may be
-            /// a summary; it is not transcript content or provider replay state.
-            public var reasoning: String?
-
             internal var providerMetadata: [String: String]?
 
             /// Creates a snapshot from partially generated content and raw content.
@@ -1123,7 +1152,7 @@ extension LanguageModelSession {
             ///   - content: The partially generated content.
             ///   - rawContent: The raw content produced by the model.
             ///   - transcriptEntries: Transcript entries accumulated so far (tool calls/outputs).
-            ///   - reasoning: Optional cumulative provider-exposed reasoning for display.
+
             ///   - usage: Provider-reported token usage so far.
             public init(
                 content: Content.PartiallyGenerated,
@@ -1132,16 +1161,14 @@ extension LanguageModelSession {
                 usage: Usage = .init(
                     input: .init(totalTokenCount: 0, cachedTokenCount: 0),
                     output: .init(totalTokenCount: 0, reasoningTokenCount: 0)
-                ),
-                reasoning: String? = nil
+                )
             ) {
                 self.init(
                     content: content,
                     rawContent: rawContent,
                     transcriptEntries: transcriptEntries,
                     usage: usage,
-                    providerMetadata: nil,
-                    reasoning: reasoning
+                    providerMetadata: nil
                 )
             }
 
@@ -1153,14 +1180,13 @@ extension LanguageModelSession {
                     input: .init(totalTokenCount: 0, cachedTokenCount: 0),
                     output: .init(totalTokenCount: 0, reasoningTokenCount: 0)
                 ),
-                providerMetadata: [String: String]?,
-                reasoning: String? = nil
+                providerMetadata: [String: String]?
             ) {
                 self.content = content
                 self.rawContent = rawContent
                 self.transcriptEntries = transcriptEntries
                 self.usage = usage
-                self.reasoning = reasoning
+
                 self.providerMetadata = providerMetadata
             }
         }
@@ -1226,8 +1252,7 @@ extension LanguageModelSession.ResponseStream: AsyncSequence {
                     rawContent: last.rawContent,
                     transcriptEntries: last.transcriptEntries,
                     usage: last.usage,
-                    providerMetadata: last.providerMetadata,
-                    reasoning: last.reasoning
+                    providerMetadata: last.providerMetadata
                 )
             }
         }
@@ -1244,8 +1269,7 @@ extension LanguageModelSession.ResponseStream: AsyncSequence {
                 rawContent: fallbackSnapshot.rawContent,
                 transcriptEntries: fallbackSnapshot.transcriptEntries,
                 usage: fallbackSnapshot.usage,
-                providerMetadata: fallbackSnapshot.providerMetadata,
-                reasoning: fallbackSnapshot.reasoning
+                providerMetadata: fallbackSnapshot.providerMetadata
             )
         }
 
@@ -1268,6 +1292,7 @@ private enum ResponseStreamError: Error, LocalizedError {
 
 private struct State: Equatable, Sendable {
     var transcript: Transcript
+    var transcriptErrorHandlingPolicy: TranscriptErrorHandlingPolicy?
     var usage = LanguageModelSession.Usage.zero
 
     var isResponding: Bool { count > 0 }

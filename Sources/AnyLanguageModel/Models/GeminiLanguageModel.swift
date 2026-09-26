@@ -321,12 +321,14 @@ public struct GeminiLanguageModel: LanguageModel {
         // full conversation because each iteration rebuilds the request from it.
         var entries: [Transcript.Entry] = []
         var usage = ReportedUsage()
+        // The text of earlier tool rounds, which string responses include.
+        var earlierText = ""
 
         var toolRounds = ToolRoundLimit(provider: "Gemini")
         // Multi-turn conversation loop for tool calling
         while true {
             let params = try createGenerateContentParams(
-                contents: try transcript.toGeminiContent(),
+                contents: transcript.toGeminiContent(),
                 tools: geminiTools,
                 generating: type,
                 schema: schema,
@@ -350,12 +352,15 @@ public struct GeminiLanguageModel: LanguageModel {
                 throw GeminiError.noCandidate
             }
 
-            let providerMetadata = try textPartMetadata(firstCandidate.content.parts ?? [])
             let functionCalls: [GeminiFunctionCall] =
                 firstCandidate.content.parts?.compactMap { part in
                     if case .functionCall(let call) = part { return call }
                     return nil
                 } ?? []
+            let providerMetadata = try textPartMetadata(
+                firstCandidate.content.parts ?? [],
+                includeUnsignedText: !functionCalls.isEmpty
+            )
 
             if !functionCalls.isEmpty {
                 // Resolve function calls
@@ -388,18 +393,14 @@ public struct GeminiLanguageModel: LanguageModel {
                         }
                     }
 
+                    if type == String.self { earlierText += textPartsText(firstCandidate.content.parts) }
+
                     // Continue the loop to send the next request with tool results
                     continue
                 }
             } else {
                 // No function calls, extract final text and return
-                let text =
-                    firstCandidate.content.parts?.compactMap { part -> String? in
-                        switch part {
-                        case .text(let t): return t.text
-                        default: return nil
-                        }
-                    }.joined() ?? ""
+                let text = earlierText + textPartsText(firstCandidate.content.parts)
 
                 if type == String.self {
                     return LanguageModelSession.Response(
@@ -493,7 +494,7 @@ public struct GeminiLanguageModel: LanguageModel {
                     while true {
                         try Task.checkCancellation()
                         let params = try createGenerateContentParams(
-                            contents: try transcript.toGeminiContent(),
+                            contents: transcript.toGeminiContent(),
                             tools: geminiTools,
                             generating: type,
                             schema: schema,
@@ -532,7 +533,7 @@ public struct GeminiLanguageModel: LanguageModel {
                         }
                         guard !functionCalls.isEmpty else { break }
                         try Task.checkCancellation()
-                        let metadata = try textPartMetadata(parts)
+                        let metadata = try textPartMetadata(parts, includeUnsignedText: true)
                         try toolRounds.record(functionCalls.map(\.roundCall))
                         switch try await resolveFunctionCalls(functionCalls, session: session) {
                         case .stop(let calls):
@@ -799,6 +800,16 @@ private func resolveFunctionCalls(
     return .invocations(results)
 }
 
+/// Joins the text parts of a Gemini response.
+private func textPartsText(_ parts: [GeminiPart]?) -> String {
+    parts?.compactMap { part -> String? in
+        switch part {
+        case .text(let t): return t.text
+        default: return nil
+        }
+    }.joined() ?? ""
+}
+
 private func emptyResponseContent<Content: Generable>(
     for type: Content.Type
 ) throws -> (content: Content, rawContent: GeneratedContent) {
@@ -843,7 +854,7 @@ private func toJSONValue(_ toolOutput: Transcript.ToolOutput) throws -> [String:
 // MARK: - Supporting Types
 
 extension Transcript {
-    fileprivate func toGeminiContent() throws -> [GeminiContent] {
+    fileprivate func toGeminiContent() -> [GeminiContent] {
         var messages = [GeminiContent]()
         for item in self {
             switch item {
@@ -862,7 +873,8 @@ extension Transcript {
                     )
                 )
             case .reasoning:
-                throw Transcript.ReasoningReplayError.unsupportedProvider("GeminiLanguageModel")
+                // Keep display history in the transcript without sending unsupported replay state.
+                continue
             case .response(let response):
                 messages.append(
                     .init(
@@ -1063,12 +1075,21 @@ private struct GeminiTextHistoryPart: Codable {
 // Keep signed text on its original part,
 // including unsigned siblings and their order relative to function calls.
 // Call arguments remain in the transcript's semantic representation.
-private func textPartMetadata(_ parts: [GeminiPart]) throws -> [String: String]? {
+// Tool-call rounds keep unsigned text too,
+// so the follow-up request replays what the model wrote before its calls.
+private func textPartMetadata(
+    _ parts: [GeminiPart],
+    includeUnsignedText: Bool = false
+) throws -> [String: String]? {
     let textParts = parts.enumerated().compactMap { index, part -> GeminiTextHistoryPart? in
         guard case .text(let text) = part else { return nil }
         return GeminiTextHistoryPart(index: index, part: text)
     }
-    guard textParts.contains(where: { $0.part.thoughtSignature != nil }) else { return nil }
+    guard
+        includeUnsignedText
+            ? !textParts.isEmpty
+            : textParts.contains(where: { $0.part.thoughtSignature != nil })
+    else { return nil }
     let data = try JSONEncoder().encode(textParts)
     return [textPartsMetadataKey: String(decoding: data, as: UTF8.self)]
 }

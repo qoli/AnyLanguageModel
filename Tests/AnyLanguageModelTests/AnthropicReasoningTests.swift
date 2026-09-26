@@ -55,7 +55,7 @@ import Testing
         }
 
         @Test(arguments: [false, true])
-        func thinkingAndCompletedToolPersistAcrossRounds(streaming: Bool) async throws {
+        func thinkingAndCompletedToolPersistForProviderToolFlow(streaming: Bool) async throws {
             ReasoningURLProtocol.reset()
             let session = LanguageModelSession(model: model(), tools: [WeatherTool()])
             let result: LanguageModelSession.Response<String>
@@ -65,16 +65,26 @@ import Testing
                 result = try await session.streamResponse(to: "Weather").collect()
             } else {
                 ReasoningURLProtocol.enqueue(json: response(tool: true))
-                ReasoningURLProtocol.enqueue(json: response())
                 result = try await session.respond(to: "Weather")
             }
-            #expect(result.content == "Answer")
-            #expect(result.transcriptEntries.count == 4)
-            #expect(Set(result.transcriptEntries.map(\.id)).count == 4)
-            #expect(ReasoningURLProtocol.recordedBodies.count == 2)
-            let body = String(decoding: ReasoningURLProtocol.recordedBodies[1], as: UTF8.self)
-            #expect(body.contains("opaque-signature"))
-            #expect(body.contains("tool_result"))
+            #expect(result.content == (streaming ? "Answer" : ""))
+            #expect(result.transcriptEntries.count == (streaming ? 4 : 3))
+            #expect(Set(result.transcriptEntries.map(\.id)).count == result.transcriptEntries.count)
+            #expect(ReasoningURLProtocol.recordedBodies.count == (streaming ? 2 : 1))
+            if streaming {
+                let body = String(decoding: ReasoningURLProtocol.recordedBodies[1], as: UTF8.self)
+                #expect(body.contains("opaque-signature"))
+                #expect(body.contains("tool_result"))
+            } else {
+                // Nonstreaming Anthropic keeps its existing one-request tool behavior.
+                let restored = try JSONDecoder().decode(Transcript.self, from: JSONEncoder().encode(session.transcript))
+                ReasoningURLProtocol.enqueue(json: response())
+                _ = try await LanguageModelSession(model: model(), tools: [WeatherTool()], transcript: restored)
+                    .respond(to: "Continue")
+                let body = String(decoding: ReasoningURLProtocol.recordedBodies[1], as: UTF8.self)
+                #expect(body.contains("opaque-signature"))
+                #expect(body.contains("tool_result"))
+            }
         }
 
         @Test(arguments: [false, true])
@@ -111,14 +121,151 @@ import Testing
             #expect(blocks.first?["data"] as? String == "opaque-redacted")
         }
 
-        @Test func unsupportedReplayFailsBeforeNetwork() async throws {
+        @Test(arguments: [false, true], [false, true])
+        func foreignReasoningIsSkippedWithoutChangingHistory(streaming: Bool, missingProvider: Bool) async throws {
+            ReasoningURLProtocol.reset()
+            let original = Transcript(entries: [
+                .prompt(.init(segments: [.text(.init(content: "Earlier question"))])),
+                .reasoning(
+                    .init(
+                        metadata: missingProvider ? [:] : ["provider": GeneratedContent("other")],
+                        segments: [.text(.init(content: "Foreign reasoning"))],
+                        signature: Data("foreign-signature".utf8)
+                    )
+                ),
+                .response(.init(assetIDs: [], segments: [.text(.init(content: "Earlier answer"))])),
+            ])
+            let restored = try JSONDecoder().decode(Transcript.self, from: JSONEncoder().encode(original))
+            let session = LanguageModelSession(model: model(), transcript: restored)
+            if streaming {
+                ReasoningURLProtocol.enqueue(eventStream: events())
+            } else {
+                ReasoningURLProtocol.enqueue(json: response())
+            }
+            let result =
+                try await streaming ? session.streamResponse(to: "Next").collect() : session.respond(to: "Next")
+            #expect(result.content == "Answer")
+            #expect(ReasoningURLProtocol.recordedBodies.count == 1)
+            let body = String(decoding: try #require(ReasoningURLProtocol.recordedBodies.first), as: UTF8.self)
+            #expect(body.contains("Earlier question"))
+            #expect(body.contains("Earlier answer"))
+            #expect(!body.contains("Foreign reasoning"))
+            #expect(!body.contains("foreign-signature"))
+            #expect(Array(session.transcript.prefix(original.count)) == Array(original))
+        }
+
+        @Test(arguments: ["chat", "responses", "open-responses", "gemini", "ollama"], [false, true])
+        func otherProviderRequestOmitsReasoningAndPreservesCodableHistory(provider: String, streaming: Bool)
+            async throws
+        {
+            ReasoningURLProtocol.reset()
+            let original = Transcript(entries: [
+                .prompt(.init(segments: [.text(.init(content: "Earlier question"))])),
+                .reasoning(
+                    .init(
+                        metadata: ["provider": GeneratedContent("anthropic")],
+                        segments: [.text(.init(content: "Private reasoning"))],
+                        signature: Data("opaque-secret".utf8)
+                    )
+                ),
+                .response(.init(assetIDs: [], segments: [.text(.init(content: "Earlier answer"))])),
+            ])
+            let restored = try JSONDecoder().decode(Transcript.self, from: JSONEncoder().encode(original))
+            let transport = ReasoningURLProtocol.makeSession()
+            let endpoint = URL(string: "https://fixture.invalid/v1/")!
+            let providerModel: any LanguageModel
+            switch provider {
+            case "chat", "responses":
+                providerModel = OpenAILanguageModel(
+                    baseURL: endpoint,
+                    apiKey: "fixture",
+                    model: "fixture",
+                    apiVariant: provider == "chat" ? .chatCompletions : .responses,
+                    session: transport
+                )
+            case "open-responses":
+                providerModel = OpenResponsesLanguageModel(
+                    baseURL: endpoint,
+                    apiKey: "fixture",
+                    model: "fixture",
+                    session: transport
+                )
+            case "gemini":
+                providerModel = GeminiLanguageModel(
+                    baseURL: endpoint,
+                    apiKey: "fixture",
+                    model: "fixture",
+                    session: transport
+                )
+            default: providerModel = OllamaLanguageModel(baseURL: endpoint, model: "fixture", session: transport)
+            }
+            let session = LanguageModelSession(model: providerModel, transcript: restored)
+            // A fixed HTTP failure isolates request projection from each provider's response decoder.
+            ReasoningURLProtocol.enqueue(json: #"{"error":{"message":"fixture rejection"}}"#, statusCode: 418)
+            do {
+                if streaming {
+                    _ = try await session.streamResponse(to: "Next").collect()
+                } else {
+                    _ = try await session.respond(to: "Next")
+                }
+                Issue.record("Expected fixture HTTP failure")
+            } catch {
+                #expect(!(error is Transcript.ReasoningReplayError))
+            }
+            #expect(ReasoningURLProtocol.recordedBodies.count == 1)
+            let body = String(decoding: try #require(ReasoningURLProtocol.recordedBodies.first), as: UTF8.self)
+            #expect(body.contains("Next"))
+            // Compare against this adapter's existing history projection. Some adapters
+            // intentionally project only the prompt or structured response metadata.
+            let withoutReasoning = Transcript(
+                entries: original.filter {
+                    if case .reasoning = $0 { return false }
+                    return true
+                }
+            )
+            let baseline = LanguageModelSession(model: providerModel, transcript: withoutReasoning)
+            ReasoningURLProtocol.enqueue(json: #"{"error":{"message":"fixture rejection"}}"#, statusCode: 418)
+            do {
+                if streaming {
+                    _ = try await baseline.streamResponse(to: "Next").collect()
+                } else {
+                    _ = try await baseline.respond(to: "Next")
+                }
+                Issue.record("Expected fixture HTTP failure")
+            } catch {}
+            #expect(ReasoningURLProtocol.recordedBodies.count == 2)
+            let baselineBody = try #require(ReasoningURLProtocol.recordedBodies.last)
+            let actualJSON = try JSONSerialization.jsonObject(with: Data(body.utf8)) as! NSDictionary
+            let baselineJSON = try JSONSerialization.jsonObject(with: baselineBody) as! NSDictionary
+            #expect(actualJSON == baselineJSON)
+            #expect(!body.contains("Private reasoning"))
+            #expect(!body.contains("opaque-secret"))
+            #expect(Array(session.transcript.prefix(original.count)) == Array(original))
+            let saved = try JSONDecoder().decode(Transcript.self, from: JSONEncoder().encode(session.transcript))
+            #expect(Array(saved.prefix(original.count)) == Array(original))
+        }
+
+        @Test(arguments: [false, true])
+        func nativeReasoningStillRejectsMissingSignature(streaming: Bool) async throws {
             ReasoningURLProtocol.reset()
             let transcript = Transcript(entries: [
-                .reasoning(.init(segments: [.text(.init(content: "Other provider"))]))
+                .reasoning(
+                    .init(
+                        metadata: ["provider": GeneratedContent("anthropic")],
+                        segments: [.text(.init(content: "Native reasoning"))]
+                    )
+                )
             ])
             let session = LanguageModelSession(model: model(), transcript: transcript)
-            await #expect(throws: Transcript.ReasoningReplayError.self) { _ = try await session.respond(to: "Next") }
+            await #expect(throws: Transcript.ReasoningReplayError.invalidSignature) {
+                if streaming {
+                    _ = try await session.streamResponse(to: "Next").collect()
+                } else {
+                    _ = try await session.respond(to: "Next")
+                }
+            }
             #expect(ReasoningURLProtocol.recordedBodies.isEmpty)
+            #expect(Array(session.transcript.prefix(transcript.count)) == Array(transcript))
         }
 
         private func response(tool: Bool = false) -> String {

@@ -18,8 +18,8 @@ struct ReasoningTests {
         #expect(!transcript.first!.description.contains("255"))
     }
 
-    @available(macOS 26.0, iOS 26.0, *)
     @Test func originalInitializerFunctionReferencesCompile() async throws {
+        guard #available(macOS 26.0, iOS 26.0, watchOS 27.0, *) else { return }
         let responseInit = LanguageModelSession.Response<String>.init(content:rawContent:transcriptEntries:usage:)
         let snapshotInit = LanguageModelSession.ResponseStream<String>.Snapshot.init(
             content:
@@ -61,64 +61,10 @@ struct ReasoningTests {
         #expect(streamed.rawContent == GeneratedContent("Answer"))
     }
 
-    @Test(arguments: [TranscriptErrorHandlingPolicy.preserveTranscript, .revertTranscript])
-    func failureRetainsCheckpointAccordingToPolicy(policy: TranscriptErrorHandlingPolicy) async throws {
-        let old = Transcript.Entry.prompt(.init(id: "old", segments: [.text(.init(content: "Old"))]))
-        let session = LanguageModelSession(model: ReasoningModel(fails: true), transcript: Transcript(entries: [old]))
-        session.transcriptErrorHandlingPolicy = policy
-        await #expect(throws: CancellationError.self) {
-            for try await _ in session.streamResponse(to: "Question") {}
-        }
-        if policy == .revertTranscript {
-            #expect(Array(session.transcript) == [old])
-        } else {
-            #expect(session.transcript.count == 5)
-            #expect(session.transcript.filter { if case .reasoning = $0 { true } else { false } }.count == 1)
-            #expect(session.transcript.filter { if case .toolOutput = $0 { true } else { false } }.count == 1)
-            #expect(!session.transcript.contains { if case .response = $0 { true } else { false } })
-        }
-    }
-
-    @Test(arguments: [false, true])
-    func consumerCancellationWaitsForTranscriptCleanup(completedTool: Bool) async throws {
-        let session = LanguageModelSession(
-            model: ReasoningModel(waitsUntilCancelled: true, completedTool: completedTool)
-        )
-        session.transcriptErrorHandlingPolicy = .preserveTranscript
-        let consumer = Task {
-            for try await _ in session.streamResponse(to: "Question") {
-                withUnsafeCurrentTask { $0?.cancel() }
-            }
-        }
-        _ = await consumer.result
-        await session.waitForResponseCompletion()
-        #expect(!session.isResponding)
-        #expect(session.transcript.count == (completedTool ? 4 : 2))
-        #expect(session.transcript.filter { if case .reasoning = $0 { true } else { false } }.count == 1)
-        #expect(!session.transcript.contains { if case .response = $0 { true } else { false } })
-    }
-
-    @Test func nonstreamFailureRevertsPrompt() async throws {
-        let session = LanguageModelSession(model: ReasoningModel(fails: true))
-        session.transcriptErrorHandlingPolicy = .revertTranscript
-        await #expect(throws: CancellationError.self) { _ = try await session.respond(to: "Question") }
-        #expect(session.transcript.isEmpty)
-    }
-
-    @Test func defaultFailureRetainsOnlyPrompt() async throws {
-        let session = LanguageModelSession(model: ReasoningModel(fails: true))
-        await #expect(throws: CancellationError.self) {
-            for try await _ in session.streamResponse(to: "Question") {}
-        }
-        #expect(session.transcript.count == 1)
-    }
 }
 
 private struct ReasoningModel: LanguageModel {
     typealias UnavailableReason = Never
-    var fails = false
-    var waitsUntilCancelled = false
-    var completedTool = false
 
     func respond<Content: Generable>(
         within session: LanguageModelSession,
@@ -148,7 +94,7 @@ private struct ReasoningModel: LanguageModel {
                 do {
                     for (text, reasoning) in [("", "First"), ("", "First second"), ("Answer", "First second")] {
                         let raw = GeneratedContent(text)
-                        var entries: [Transcript.Entry] = [
+                        let entries: [Transcript.Entry] = [
                             .reasoning(
                                 .init(
                                     id: "reason",
@@ -156,21 +102,6 @@ private struct ReasoningModel: LanguageModel {
                                 )
                             )
                         ]
-                        if fails || completedTool {
-                            entries.append(
-                                .toolCalls(
-                                    .init(
-                                        id: "calls",
-                                        [.init(id: "call", toolName: "fixture", arguments: GeneratedContent("{}"))]
-                                    )
-                                )
-                            )
-                            entries.append(
-                                .toolOutput(
-                                    .init(id: "call", toolName: "fixture", segments: [.text(.init(content: "Done"))])
-                                )
-                            )
-                        }
                         continuation.yield(
                             .init(
                                 content: try Content(raw).asPartiallyGenerated(),
@@ -178,8 +109,6 @@ private struct ReasoningModel: LanguageModel {
                                 transcriptEntries: ArraySlice(entries)
                             )
                         )
-                        if fails { throw CancellationError() }
-                        if waitsUntilCancelled { return }
                     }
                     continuation.finish()
                 } catch { continuation.finish(throwing: error) }

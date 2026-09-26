@@ -479,7 +479,7 @@ public struct OpenAILanguageModel: LanguageModel {
         switch apiVariant {
         case .chatCompletions:
             return try await respondWithChatCompletions(
-                messages: try session.transcript.toOpenAIMessages(),
+                messages: session.transcript.toOpenAIMessages(),
                 tools: openAITools,
                 generating: type,
                 schema: schema,
@@ -488,7 +488,7 @@ public struct OpenAILanguageModel: LanguageModel {
             )
         case .responses:
             return try await respondWithResponses(
-                messages: try session.transcript.toOpenAIMessages(),
+                messages: session.transcript.toOpenAIMessages(),
                 tools: openAITools,
                 generating: type,
                 schema: schema,
@@ -510,6 +510,8 @@ public struct OpenAILanguageModel: LanguageModel {
         var entries: [Transcript.Entry] = []
         var usage = ReportedUsage()
         var text = ""
+        // The text of earlier tool rounds, which string responses include.
+        var earlierText = ""
         var messages = messages
 
         var toolRounds = ToolRoundLimit(provider: "OpenAI")
@@ -586,12 +588,13 @@ public struct OpenAILanguageModel: LanguageModel {
                                 )
                             )
                         }
+                        if type == String.self { earlierText += toolCallMessage.content ?? "" }
                         continue
                     }
                 }
             }
 
-            text = choice.message.content ?? ""
+            text = earlierText + (choice.message.content ?? "")
             break
         }
 
@@ -625,6 +628,8 @@ public struct OpenAILanguageModel: LanguageModel {
         var entries: [Transcript.Entry] = []
         var usage = ReportedUsage()
         var text = ""
+        // The text of earlier tool rounds, which string responses include.
+        var earlierText = ""
         var lastOutput: [JSONValue]?
         var messages = messages
 
@@ -692,12 +697,15 @@ public struct OpenAILanguageModel: LanguageModel {
                                 )
                             )
                         }
+                        if type == String.self {
+                            earlierText += resp.outputText ?? extractTextFromOutput(resp.output) ?? ""
+                        }
                         continue
                     }
                 }
             }
 
-            text = resp.outputText ?? extractTextFromOutput(resp.output) ?? ""
+            text = earlierText + (resp.outputText ?? extractTextFromOutput(resp.output) ?? "")
 
             break
         }
@@ -771,7 +779,7 @@ public struct OpenAILanguageModel: LanguageModel {
             continuation in
             let task = Task {
                 do {
-                    var messages = try session.transcript.toOpenAIMessages()
+                    var messages = session.transcript.toOpenAIMessages()
                     var state = StreamingResponseState<Content>()
                     var toolRounds = ToolRoundLimit(provider: "OpenAI")
                     while true {
@@ -829,6 +837,11 @@ public struct OpenAILanguageModel: LanguageModel {
                                     }
                                     if let snapshot = state.snapshot() { continuation.yield(snapshot) }
                                     break responseEvents
+                                case .failed(let failure):
+                                    throw OpenAILanguageModelError.streamFailed(
+                                        code: failure?.code,
+                                        message: failure?.message
+                                    )
                                 case .ignored:
                                     break
                                 }
@@ -1283,7 +1296,7 @@ private enum Responses {
         let id: String
         let output: [JSONValue]?
         let usage: ResponsesUsage?
-        let error: [JSONValue]?
+        let error: ResponseError?
         let outputText: String?
         let finishReason: String?
 
@@ -1296,12 +1309,18 @@ private enum Responses {
             case error = "error"
         }
     }
+
+    /// The `error` object of a response, which is `null` unless the response failed.
+    struct ResponseError: Decodable, Sendable {
+        let code: String?
+        let message: String?
+    }
 }
 
 // MARK: - Supporting Types
 
 extension Transcript {
-    fileprivate func toOpenAIMessages() throws -> [OpenAIMessage] {
+    fileprivate func toOpenAIMessages() -> [OpenAIMessage] {
         var messages = [OpenAIMessage]()
         for item in self {
             switch item {
@@ -1320,7 +1339,8 @@ extension Transcript {
                     )
                 )
             case .reasoning:
-                throw Transcript.ReasoningReplayError.unsupportedProvider("OpenAILanguageModel")
+                // Keep display history in the transcript without sending unsupported replay state.
+                continue
             case .response(let response):
                 messages.append(
                     .init(
@@ -1617,6 +1637,7 @@ private struct OpenAIToolFunction: Codable, Sendable {
 private enum OpenAIResponsesServerEvent: Decodable, Sendable {
     case outputTextDelta(String)
     case completed(Responses.Response?)
+    case failed(ResponseStreamFailure?)
     case ignored
 
     init(from decoder: any Decoder) throws {
@@ -1627,6 +1648,8 @@ private enum OpenAIResponsesServerEvent: Decodable, Sendable {
             self = .outputTextDelta(try container.decode(String.self, forKey: .delta))
         case "response.completed":
             self = .completed(try container.decodeIfPresent(Responses.Response.self, forKey: .response))
+        case "response.failed":
+            self = .failed(ResponseStreamFailure(from: container, forKey: .response))
         default:
             self = .ignored
         }
@@ -1988,13 +2011,28 @@ private func extractToolCallsFromOutput(_ output: [JSONValue]?) -> [OpenAIToolCa
 
 // MARK: - Errors
 
-enum OpenAILanguageModelError: LocalizedError {
+/// Errors that can occur when using ``OpenAILanguageModel``.
+public enum OpenAILanguageModelError: LocalizedError {
+    /// The response contained no output to use.
+    ///
+    /// The Chat Completions API returned no choices,
+    /// or the Responses API returned no JSON for structured output.
     case noResponseGenerated
 
-    var errorDescription: String? {
+    /// The server sent a `response.failed` event
+    /// while streaming from the Responses API.
+    ///
+    /// - Parameters:
+    ///   - code: The error code from the failed response, if the server sent one.
+    ///   - message: The error message from the failed response, if the server sent one.
+    case streamFailed(code: String?, message: String?)
+
+    public var errorDescription: String? {
         switch self {
         case .noResponseGenerated:
             return "No response was generated by the model"
+        case .streamFailed(let code, let message):
+            return streamFailureDescription(code: code, message: message)
         }
     }
 }

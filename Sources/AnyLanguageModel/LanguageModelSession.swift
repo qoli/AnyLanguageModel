@@ -1,26 +1,11 @@
 import Foundation
 import Observation
 
-/// Controls transcript retention when generation fails or is cancelled.
-public enum TranscriptErrorHandlingPolicy: Sendable, Equatable {
-    /// Retain the prompt and the latest cumulative streaming checkpoint.
-    /// Nonstreaming failures have no checkpoint and retain only the prompt.
-    case preserveTranscript
-    /// Restore the transcript as it was before the request. Tool side effects are not undone.
-    case revertTranscript
-}
-
 @Observable
 public final class LanguageModelSession: @unchecked Sendable {
     public var isResponding: Bool {
         access(keyPath: \.isResponding)
         return state.withLock { $0.isResponding }
-    }
-
-    /// `nil` retains the existing failure behavior (the prompt remains).
-    public var transcriptErrorHandlingPolicy: TranscriptErrorHandlingPolicy? {
-        get { state.withLock { $0.transcriptErrorHandlingPolicy } }
-        set { state.withLock { $0.transcriptErrorHandlingPolicy = newValue } }
     }
 
     public var transcript: Transcript {
@@ -38,16 +23,6 @@ public final class LanguageModelSession: @unchecked Sendable {
     }
 
     @ObservationIgnored private let state: Locked<State>
-    @ObservationIgnored private let responseRelay = Locked<Task<Void, Never>?>(nil)
-
-    /// Waits for the current streaming response relay to finish transcript cleanup.
-    /// Call after cancelling a consumer, before persisting the transcript or starting
-    /// another response. This synchronization API is an AnyLanguageModel extension.
-    /// Do not call from a tool executing within the same response.
-    nonisolated public func waitForResponseCompletion() async {
-        let task = responseRelay.withLock { $0 }
-        await task?.value
-    }
 
     private let model: any LanguageModel
     public let tools: [any Tool]
@@ -166,16 +141,12 @@ public final class LanguageModelSession: @unchecked Sendable {
     }
 
     nonisolated private func wrapRespond<T>(_ operation: () async throws -> T) async throws -> T {
-        let initialTranscript = transcript
         beginResponding()
         do {
             let result = try await operation()
             endResponding()
             return result
         } catch {
-            if transcriptErrorHandlingPolicy == .revertTranscript {
-                withMutation(keyPath: \.transcript) { state.withLock { $0.transcript = initialTranscript } }
-            }
             endResponding()
             throw error
         }
@@ -198,10 +169,6 @@ public final class LanguageModelSession: @unchecked Sendable {
                         session.recordUsage(snapshot.usage.increment(since: &accountedUsage))
                         continuation.yield(snapshot)
                     }
-
-                    // AsyncThrowingStream may end normally when its task is cancelled.
-                    // A partial snapshot must not become a completed transcript response.
-                    try Task.checkCancellation()
 
                     // Commit the response to the transcript
                     // before the stream reports completion,
@@ -233,25 +200,10 @@ public final class LanguageModelSession: @unchecked Sendable {
                     session.endResponding()
                     continuation.finish()
                 } catch {
-                    session.withMutation(keyPath: \.transcript) {
-                        session.state.withLock { state in
-                            switch state.transcriptErrorHandlingPolicy {
-                            case .preserveTranscript:
-                                state.transcript.append(contentsOf: lastSnapshot?.transcriptEntries ?? [])
-                            case .revertTranscript:
-                                state.transcript = Transcript(
-                                    entries: state.transcript.prefix { $0.id != promptEntry.id }
-                                )
-                            case nil:
-                                break
-                            }
-                        }
-                    }
                     session.endResponding()
                     continuation.finish(throwing: error)
                 }
             }
-            session.responseRelay.withLock { $0 = task }
             continuation.onTermination = { termination in
                 if case .cancelled = termination {
                     task.cancel()
@@ -398,7 +350,6 @@ public final class LanguageModelSession: @unchecked Sendable {
         ///   - content: The decoded response content.
         ///   - rawContent: The raw content produced by the model.
         ///   - transcriptEntries: Transcript entries associated with the response.
-
         ///   - usage: Provider-reported token usage.
         public init(
             content: Content,
@@ -432,7 +383,6 @@ public final class LanguageModelSession: @unchecked Sendable {
             self.rawContent = rawContent
             self.transcriptEntries = transcriptEntries
             self.usage = usage
-
             self.providerMetadata = providerMetadata
         }
     }
@@ -1098,7 +1048,6 @@ extension LanguageModelSession {
         /// - Parameters:
         ///   - content: The complete response content.
         ///   - rawContent: The raw content produced by the model.
-
         ///   - usage: Provider-reported token usage.
         public init(
             content: Content,
@@ -1125,10 +1074,6 @@ extension LanguageModelSession {
         }
 
         /// A snapshot of partially generated content and response metadata.
-        ///
-        /// A snapshot still requires a valid `Content.PartiallyGenerated` value.
-        /// For scalar or enum types that cannot represent an absent answer, a provider
-        /// may defer reasoning updates until a valid partial answer exists.
         public struct Snapshot: Sendable where Content.PartiallyGenerated: Sendable {
             /// The partially generated response content.
             public var content: Content.PartiallyGenerated
@@ -1136,7 +1081,7 @@ extension LanguageModelSession {
             /// The raw content produced so far by the model.
             public var rawContent: GeneratedContent
 
-            /// Transcript entries (tool calls and outputs) produced so far while streaming.
+            /// Transcript entries (reasoning, tool calls and outputs) produced so far while streaming.
             /// Cumulative across tool rounds;
             /// empty for providers that don't stream tool activity.
             public var transcriptEntries: ArraySlice<Transcript.Entry>
@@ -1151,8 +1096,7 @@ extension LanguageModelSession {
             /// - Parameters:
             ///   - content: The partially generated content.
             ///   - rawContent: The raw content produced by the model.
-            ///   - transcriptEntries: Transcript entries accumulated so far (tool calls/outputs).
-
+            ///   - transcriptEntries: Transcript entries accumulated so far (reasoning/tool calls/outputs).
             ///   - usage: Provider-reported token usage so far.
             public init(
                 content: Content.PartiallyGenerated,
@@ -1186,7 +1130,6 @@ extension LanguageModelSession {
                 self.rawContent = rawContent
                 self.transcriptEntries = transcriptEntries
                 self.usage = usage
-
                 self.providerMetadata = providerMetadata
             }
         }
@@ -1292,7 +1235,6 @@ private enum ResponseStreamError: Error, LocalizedError {
 
 private struct State: Equatable, Sendable {
     var transcript: Transcript
-    var transcriptErrorHandlingPolicy: TranscriptErrorHandlingPolicy?
     var usage = LanguageModelSession.Usage.zero
 
     var isResponding: Bool { count > 0 }

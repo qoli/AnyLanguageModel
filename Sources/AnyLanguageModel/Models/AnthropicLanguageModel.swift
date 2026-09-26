@@ -449,84 +449,87 @@ public struct AnthropicLanguageModel: LanguageModel {
         }
 
         let responseSchema = type == String.self ? nil : try convertSchemaToAnthropicFormat(schema)
-        var messages = try session.transcript.toAnthropicMessages()
-        var entries: [Transcript.Entry] = []
-        var usage = LanguageModelSession.Usage.zero
-        var toolRounds = ToolRoundLimit(provider: "Anthropic")
-        while true {
-            try Task.checkCancellation()
-            let params = try createMessageParams(
-                model: model,
-                system: nil,
-                messages: messages,
-                tools: anthropicTools.isEmpty ? nil : anthropicTools,
-                responseSchema: responseSchema,
-                options: options
-            )
-            let message: AnthropicMessageResponse = try await httpSession.fetch(
-                .post,
-                url: url,
-                headers: headers,
-                body: try JSONEncoder().encode(params)
-            )
-            usage.add(message.usage?.reportedUsage?.value ?? .zero)
-            entries.append(
-                contentsOf: message.content.compactMap { block in
-                    switch block {
-                    case .thinking(let thinking): return .reasoning(thinking.transcriptReasoning())
-                    case .redactedThinking(let redacted): return .reasoning(redacted.transcriptReasoning())
-                    default: return nil
+        let params = try createMessageParams(
+            model: model,
+            system: nil,
+            messages: try session.transcript.toAnthropicMessages(),
+            tools: anthropicTools.isEmpty ? nil : anthropicTools,
+            responseSchema: responseSchema,
+            options: options
+        )
+
+        let body = try JSONEncoder().encode(params)
+
+        let message: AnthropicMessageResponse = try await httpSession.fetch(
+            .post,
+            url: url,
+            headers: headers,
+            body: body
+        )
+
+        var entries: [Transcript.Entry] = message.content.compactMap { block in
+            switch block {
+            case .thinking(let thinking): return .reasoning(thinking.transcriptReasoning())
+            case .redactedThinking(let redacted): return .reasoning(redacted.transcriptReasoning())
+            default: return nil
+            }
+        }
+        let usage = message.usage?.reportedUsage?.value ?? .zero
+
+        // Handle tool calls, if present
+        let toolUses: [AnthropicToolUse] = message.content.compactMap { block in
+            if case .toolUse(let u) = block { return u }
+            return nil
+        }
+
+        if !toolUses.isEmpty {
+            let resolution = try await resolveToolUses(toolUses, session: session)
+            switch resolution {
+            case .stop(let calls):
+                if !calls.isEmpty {
+                    entries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                }
+                let empty = try emptyResponseContent(for: type)
+                return LanguageModelSession.Response(
+                    content: empty.content,
+                    rawContent: empty.rawContent,
+                    transcriptEntries: ArraySlice(entries),
+                    usage: usage
+                )
+            case .invocations(let invocations):
+                if !invocations.isEmpty {
+                    entries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+                    for invocation in invocations {
+                        entries.append(.toolOutput(invocation.output))
                     }
                 }
-            )
-            let toolUses: [AnthropicToolUse] = message.content.compactMap { block in
-                if case .toolUse(let use) = block { return use }
-                return nil
             }
-            if !toolUses.isEmpty {
-                try toolRounds.record(toolUses.map(\.roundCall))
-                switch try await resolveToolUses(toolUses, session: session) {
-                case .stop(let calls):
-                    entries.append(.toolCalls(Transcript.ToolCalls(calls)))
-                    let empty = try emptyResponseContent(for: type)
-                    return .init(
-                        content: empty.content,
-                        rawContent: empty.rawContent,
-                        transcriptEntries: ArraySlice(entries),
-                        usage: usage
-                    )
-                case .invocations(let invocations):
-                    entries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
-                    entries.append(contentsOf: invocations.map { .toolOutput($0.output) })
-                    messages.append(.init(role: .assistant, content: message.content))
-                    messages.append(
-                        .init(
-                            role: .user,
-                            content: invocations.map {
-                                .toolResult(
-                                    .init(
-                                        toolUseId: $0.call.id,
-                                        content: convertSegmentsToAnthropicContent($0.output.segments)
-                                    )
-                                )
-                            }
-                        )
-                    )
-                    continue
-                }
+        }
+
+        let text = message.content.compactMap { block -> String? in
+            switch block {
+            case .text(let t): return t.text
+            default: return nil
             }
-            let text = message.content.compactMap { block -> String? in
-                if case .text(let text) = block { return text.text }
-                return nil
-            }.joined()
-            let rawContent = type == String.self ? GeneratedContent(text) : try GeneratedContent(json: text)
-            return .init(
-                content: try Content(rawContent),
-                rawContent: rawContent,
+        }.joined()
+
+        if type == String.self {
+            return LanguageModelSession.Response(
+                content: text as! Content,
+                rawContent: GeneratedContent(text),
                 transcriptEntries: ArraySlice(entries),
                 usage: usage
             )
         }
+
+        let rawContent = try GeneratedContent(json: text)
+        let content = try Content(rawContent)
+        return LanguageModelSession.Response(
+            content: content,
+            rawContent: rawContent,
+            transcriptEntries: ArraySlice(entries),
+            usage: usage
+        )
     }
 
     public func streamResponse<Content>(
@@ -1026,7 +1029,8 @@ extension Transcript {
                 )
             case .reasoning(let reasoning):
                 guard reasoning.metadata["provider"] == GeneratedContent("anthropic") else {
-                    throw Transcript.ReasoningReplayError.unsupportedProvider("AnthropicLanguageModel")
+                    // Foreign reasoning remains display history, not Anthropic replay state.
+                    continue
                 }
                 guard let data = reasoning.signature, let signature = String(data: data, encoding: .utf8),
                     !signature.isEmpty

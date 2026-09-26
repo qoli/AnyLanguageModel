@@ -435,7 +435,7 @@ public struct OpenResponsesLanguageModel: LanguageModel {
         let tools: [OpenResponsesTool]? =
             session.tools.isEmpty ? nil : session.tools.map { convertToolToOpenResponsesFormat($0) }
         return try await respondWithOpenResponses(
-            messages: try session.transcript.toOpenResponsesMessages(),
+            messages: session.transcript.toOpenResponsesMessages(),
             tools: tools,
             generating: type,
             schema: schema,
@@ -493,7 +493,7 @@ public struct OpenResponsesLanguageModel: LanguageModel {
             continuation in
             let task = Task {
                 do {
-                    var messages = try session.transcript.toOpenResponsesMessages()
+                    var messages = session.transcript.toOpenResponsesMessages()
                     var state = StreamingResponseState<Content>()
                     var toolRounds = ToolRoundLimit(provider: "Open Responses")
                     while true {
@@ -533,8 +533,11 @@ public struct OpenResponsesLanguageModel: LanguageModel {
                                 }
                                 if let snapshot = state.snapshot() { continuation.yield(snapshot) }
                                 break responseEvents
-                            case .failed:
-                                throw OpenResponsesLanguageModelError.streamFailed
+                            case .failed(let failure):
+                                throw OpenResponsesLanguageModelError.streamFailed(
+                                    code: failure?.code,
+                                    message: failure?.message
+                                )
                             case .ignored:
                                 break
                             }
@@ -587,6 +590,8 @@ public struct OpenResponsesLanguageModel: LanguageModel {
         var entries: [Transcript.Entry] = []
         var usage = ReportedUsage()
         var text = ""
+        // The text of earlier tool rounds, which string responses include.
+        var earlierText = ""
         var lastOutput: [JSONValue]?
         var messages = messages
         let url = baseURL.appendingPathComponent("responses")
@@ -646,12 +651,15 @@ public struct OpenResponsesLanguageModel: LanguageModel {
                                 )
                             )
                         }
+                        if type == String.self {
+                            earlierText += resp.outputText ?? extractTextFromOutput(resp.output) ?? ""
+                        }
                         continue
                     }
                 }
             }
 
-            text = resp.outputText ?? extractTextFromOutput(resp.output) ?? ""
+            text = earlierText + (resp.outputText ?? extractTextFromOutput(resp.output) ?? "")
             break
         }
 
@@ -896,7 +904,7 @@ private enum OpenResponsesBlock: Sendable {
 }
 
 extension Transcript {
-    fileprivate func toOpenResponsesMessages() throws -> [OpenResponsesMessage] {
+    fileprivate func toOpenResponsesMessages() -> [OpenResponsesMessage] {
         var list: [OpenResponsesMessage] = []
         for item in self {
             switch item {
@@ -915,7 +923,8 @@ extension Transcript {
                     )
                 )
             case .reasoning:
-                throw Transcript.ReasoningReplayError.unsupportedProvider("OpenResponsesLanguageModel")
+                // Keep display history in the transcript without sending unsupported replay state.
+                continue
             case .response(let response):
                 list.append(
                     OpenResponsesMessage(
@@ -1211,7 +1220,7 @@ private func resolveToolCalls(
 private enum OpenResponsesStreamEvent: Decodable, Sendable {
     case outputTextDelta(String)
     case completed(OpenResponsesAPI.Response?)
-    case failed
+    case failed(ResponseStreamFailure?)
     case ignored
 
     init(from decoder: Decoder) throws {
@@ -1223,7 +1232,7 @@ private enum OpenResponsesStreamEvent: Decodable, Sendable {
         case "response.completed":
             self = .completed(try c.decodeIfPresent(OpenResponsesAPI.Response.self, forKey: .response))
         case "response.failed":
-            self = .failed
+            self = .failed(ResponseStreamFailure(from: c, forKey: .response))
         default:
             self = .ignored
         }
@@ -1233,17 +1242,24 @@ private enum OpenResponsesStreamEvent: Decodable, Sendable {
 
 // MARK: - Errors
 
-/// Errors produced by ``OpenResponsesLanguageModel``.
-enum OpenResponsesLanguageModelError: LocalizedError, Sendable {
-    /// The API returned no parseable text or structured output.
+/// Errors that can occur when using ``OpenResponsesLanguageModel``.
+public enum OpenResponsesLanguageModelError: LocalizedError, Sendable {
+    /// The response contained no output to use.
+    ///
+    /// The API returned no JSON for structured output.
     case noResponseGenerated
-    /// The stream reported a failure event.
-    case streamFailed
 
-    var errorDescription: String? {
+    /// The server sent a `response.failed` event while streaming.
+    ///
+    /// - Parameters:
+    ///   - code: The error code from the failed response, if the server sent one.
+    ///   - message: The error message from the failed response, if the server sent one.
+    case streamFailed(code: String?, message: String?)
+
+    public var errorDescription: String? {
         switch self {
         case .noResponseGenerated: return "No response was generated by the model"
-        case .streamFailed: return "The stream reported a failure event"
+        case .streamFailed(let code, let message): return streamFailureDescription(code: code, message: message)
         }
     }
 }

@@ -382,6 +382,33 @@ pass the model's multimodal projector with `mmprojPath:`.
 > Image inputs are an AnyLanguageModel extension.
 > See [Differences from Foundation Models](#differences-from-foundation-models).
 
+### Prompt attachments
+
+Image attachments follow the Foundation Models 27 `Attachment` and `Prompt`
+construction syntax, including ordinary Tool outputs:
+
+```swift
+func call(arguments: Arguments) async throws -> Prompt {
+    Prompt {
+        "Image read from the selected file"
+        Attachment(imageURL: fileURL)
+    }
+}
+```
+
+On Apple platforms, `Attachment(CGImage, orientation:)` also retains typed image
+content. Prompts, builders and Tool outputs preserve image order rather than
+serializing images into text. The OS 26 compatibility transcript still stores
+these as `Transcript.Segment.image`; its existing Codable format is unchanged.
+SystemLanguageModel and FoundationLanguageModel bridge attachments on OS 27.
+Older system runtimes reject attachments explicitly. The system bridge requires
+local file URLs; other provider adapters retain URL images in their own supported
+form. This is not a claim that every built-in provider supports image Tool output.
+
+This compatibility surface currently covers CGImage and imageURL attachments;
+CIImage, pixel-buffer, labels, instruction attachments and newer data attachments
+remain outside this back-deployment implementation.
+
 ### Tool Calling
 
 Tool calling is supported by all providers.
@@ -613,6 +640,10 @@ say which API they follow.
   [image inputs](#image-inputs).
   Foundation Models 27 adds prompt attachments,
   and AnyLanguageModel 2.0 will change to match them.
+- `Tool.makeOutputSegments(from:)`, exposed only through the `Compatibility` SPI:
+  an integration extension for back-deployment provider adapters to lower normal
+  Tool outputs into the compatibility transcript. It is not an Apple Tool API;
+  OS 27 canonical executors use Foundation Models' own Tool execution instead.
 - `ToolExecutionDelegate`, `ToolExecutionDecision`, and `toolExecutionDelegate`:
   [observing and controlling tool calls](#tool-calling).
 - `transcriptErrorHandlingPolicy` and `waitForResponseCompletion()`:

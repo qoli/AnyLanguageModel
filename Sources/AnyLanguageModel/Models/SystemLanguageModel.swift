@@ -194,7 +194,7 @@
             includeSchemaInPrompt: Bool,
             options: GenerationOptions
         ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
-            let fmPrompt = prompt.toFoundationModels()
+            let fmPrompt = try prompt.toFoundationModels()
             let fmOptions = options.toFoundationModels()
 
             return try await fmRespond(
@@ -249,7 +249,10 @@
             includeSchemaInPrompt: Bool,
             options: GenerationOptions
         ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
-            let fmPrompt = prompt.toFoundationModels()
+            let fmPrompt: FoundationModels.Prompt
+            do { fmPrompt = try prompt.toFoundationModels() } catch {
+                return .init(stream: AsyncThrowingStream { $0.finish(throwing: error) })
+            }
             let fmOptions = options.toFoundationModels()
 
             return fmStreamResponse(
@@ -430,8 +433,35 @@
 
     @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
     extension Prompt {
-        func toFoundationModels() -> FoundationModels.Prompt {
-            FoundationModels.Prompt(self.description)
+        func toFoundationModels() throws -> FoundationModels.Prompt {
+            let prompts: [FoundationModels.Prompt] = try components.map { component in
+                switch component {
+                case .text(let text): return FoundationModels.Prompt(text.content)
+                case .image(_, let image):
+                    #if compiler(>=6.4) && !os(tvOS) && !os(watchOS)
+                        if #available(macOS 27, iOS 27, visionOS 27, *) {
+                            switch image.source {
+                            case .url(let url, let orientation):
+                                guard url.isFileURL else { throw PromptBridgeError.nonFileImageURL }
+                                return FoundationModels.Prompt(
+                                    FoundationModels.Attachment(
+                                        imageURL: url,
+                                        orientation: orientation.flatMap(CGImagePropertyOrientation.init(rawValue:))
+                                    )
+                                )
+                            case .image(let value, let orientation):
+                                return FoundationModels.Prompt(
+                                    FoundationModels.Attachment(value, orientation: orientation)
+                                )
+                            }
+                        }
+                    #endif
+                    throw PromptBridgeError.attachmentsUnavailable
+                }
+            }
+            return FoundationModels.Prompt {
+                for prompt in prompts { prompt }
+            }
         }
     }
 
@@ -517,11 +547,16 @@
         }
     }
 
+    enum PromptBridgeError: Error {
+        case attachmentsUnavailable
+        case nonFileImageURL
+    }
+
     /// A type-erased wrapper that bridges any `Tool` to `FoundationModels.Tool`.
     @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
     private struct AnyToolWrapper: FoundationModels.Tool {
         typealias Arguments = FoundationModels.GeneratedContent
-        typealias Output = String
+        typealias Output = FoundationModels.Prompt
 
         let name: String
         let description: String
@@ -540,7 +575,7 @@
 
         func call(arguments: FoundationModels.GeneratedContent) async throws -> Output {
             let output = try await wrappedTool.callFunction(arguments: arguments)
-            return output.promptRepresentation.description
+            return try output.promptRepresentation.toFoundationModels()
         }
     }
 
@@ -924,7 +959,10 @@
                     else {
                         return nil
                     }
-                    self.init(cgImage)
+                    let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any]
+                    let orientation = (properties?[kCGImagePropertyOrientation] as? NSNumber)
+                        .flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
+                    self.init(cgImage, orientation: orientation)
                 }
             }
         }

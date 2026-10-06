@@ -5,6 +5,26 @@ import Testing
 
 @Suite("Dynamic instructions")
 struct DynamicInstructionsTests {
+    @Test func dynamicSessionLeavesInstructionsOutOfHistoryAndSessionProperties() {
+        let state = DynamicFixtureState()
+        let history: [Transcript.Entry] = [
+            .instructions(Transcript.Instructions(segments: [.text(.init(content: "Old"))], toolDefinitions: [])),
+            .prompt(Transcript.Prompt(segments: [.text(.init(content: "Hello"))])),
+        ]
+        let session = LanguageModelSession(
+            model: DynamicContextModel(state: state, continuesAfterTool: false),
+            dynamicInstructions: FixtureDynamicInstructions(state: state),
+            history: history
+        )
+
+        #expect(session.instructions == nil)
+        #expect(session.tools.isEmpty)
+        #expect(session.transcript.count == 1)
+        let context = session.resolvedRequestContext()
+        #expect(context.instructions?.description == "Instructions A")
+        #expect(context.transcript.count == 2)
+    }
+
     @Test func bodyReevaluatesForEveryNonstreamingRequest() async throws {
         let state = DynamicFixtureState()
         let model = DynamicContextModel(state: state, continuesAfterTool: false)

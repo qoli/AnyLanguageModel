@@ -4,6 +4,10 @@
 /// Compose values in ``body`` with ``DynamicInstructionsBuilder``. The session
 /// evaluates the body again for every model request, including requests that
 /// continue a response after tool execution.
+///
+/// - Note: This API is exclusive to AnyLanguageModel on OS 26.
+///   It follows the Foundation Models 27 `DynamicInstructions` API,
+///   so code that uses it ports to Foundation Models on OS 27.
 @_typeEraser(AnyDynamicInstructions)
 public protocol DynamicInstructions {
     associatedtype Body: DynamicInstructions
@@ -14,6 +18,10 @@ public protocol DynamicInstructions {
 
 /// Builds declarative dynamic instructions from instructions, tools, nested
 /// dynamic instructions, and conditional content.
+///
+/// - Note: This API is exclusive to AnyLanguageModel on OS 26.
+///   It follows the Foundation Models 27 `DynamicInstructionsBuilder` API,
+///   so code that uses it ports to Foundation Models on OS 27.
 @resultBuilder
 public struct DynamicInstructionsBuilder {
     public static func buildExpression<T>(_ expression: T) -> some DynamicInstructions where T: Tool {
@@ -73,6 +81,10 @@ public struct DynamicInstructionsBuilder {
 }
 
 /// A type-erased dynamic-instructions value.
+///
+/// - Note: This API is exclusive to AnyLanguageModel on OS 26.
+///   It follows the Foundation Models 27 `AnyDynamicInstructions` API,
+///   so code that uses it ports to Foundation Models on OS 27.
 public struct AnyDynamicInstructions: DynamicInstructions {
     public typealias Body = Never
 
@@ -96,6 +108,10 @@ public struct AnyDynamicInstructions: DynamicInstructions {
 }
 
 /// A dynamic-instructions value that contains an ordered tuple of components.
+///
+/// - Note: This API is exclusive to AnyLanguageModel on OS 26.
+///   It follows the Foundation Models 27 `TupleDynamicInstructions` API,
+///   so code that uses it ports to Foundation Models on OS 27.
 public struct TupleDynamicInstructions<each Content>: DynamicInstructions
 where repeat each Content: DynamicInstructions {
     public typealias Body = Never
@@ -112,6 +128,10 @@ where repeat each Content: DynamicInstructions {
 }
 
 /// A dynamic-instructions value that contains one of two branches.
+///
+/// - Note: This API is exclusive to AnyLanguageModel on OS 26.
+///   It follows the Foundation Models 27 `ConditionalDynamicInstructions` API,
+///   so code that uses it ports to Foundation Models on OS 27.
 public struct ConditionalDynamicInstructions<TrueContent, FalseContent>: DynamicInstructions
 where TrueContent: DynamicInstructions, FalseContent: DynamicInstructions {
     public enum Branch {
@@ -147,6 +167,10 @@ extension Never: DynamicInstructions {
 }
 
 /// An empty dynamic-instructions value.
+///
+/// - Note: This API is exclusive to AnyLanguageModel on OS 26.
+///   It follows the Foundation Models 27 `EmptyDynamicInstructions` API,
+///   so code that uses it ports to Foundation Models on OS 27.
 public struct EmptyDynamicInstructions: DynamicInstructions, Sendable {
     public typealias Body = Never
 
@@ -158,6 +182,10 @@ public struct EmptyDynamicInstructions: DynamicInstructions, Sendable {
 }
 
 /// Builds dynamic instructions from a collection.
+///
+/// - Note: This API is exclusive to AnyLanguageModel on OS 26.
+///   It follows the Foundation Models 27 `DynamicInstructionsForEach` API,
+///   so code that uses it ports to Foundation Models on OS 27.
 public struct DynamicInstructionsForEach<Data, ID, Content>: DynamicInstructions
 where Data: RandomAccessCollection, ID: Hashable, Content: DynamicInstructions {
     public typealias Body = Never
@@ -201,33 +229,30 @@ extension Instructions: DynamicInstructions {
 }
 
 struct ResolvedDynamicInstructions: Sendable {
-    let instructions: Instructions?
-    let tools: [any Tool]
+    /// The text of each instructions component, in order.
+    private var instructionTexts: [String]
 
-    fileprivate init(instructions: Instructions?, tools: [any Tool]) {
-        self.instructions = instructions
+    /// The tools, in order.
+    private(set) var tools: [any Tool]
+
+    fileprivate init(instructionTexts: [String], tools: [any Tool]) {
+        self.instructionTexts = instructionTexts
         self.tools = tools
     }
 
-    fileprivate static let empty = Self(instructions: nil, tools: [])
+    fileprivate static let empty = Self(instructionTexts: [], tools: [])
 
-    fileprivate func appending(_ other: Self) -> Self {
-        let combinedInstructions: Instructions?
-        switch (instructions, other.instructions) {
-        case (nil, nil):
-            combinedInstructions = nil
-        case (let instructions?, nil), (nil, let instructions?):
-            combinedInstructions = instructions
-        case (let first?, let second?):
-            combinedInstructions = Instructions {
-                first
-                second
-            }
-        }
-        return Self(
-            instructions: combinedInstructions,
-            tools: tools + other.tools
-        )
+    /// The instructions components joined by newlines, or `nil` if there are none.
+    ///
+    /// Each component keeps its whitespace,
+    /// so the result doesn't depend on how the components are nested.
+    var instructions: Instructions? {
+        instructionTexts.isEmpty ? nil : Instructions(instructionTexts.joined(separator: "\n"))
+    }
+
+    fileprivate mutating func append(_ other: Self) {
+        instructionTexts += other.instructionTexts
+        tools += other.tools
     }
 }
 
@@ -249,7 +274,7 @@ private struct DynamicTool: DynamicInstructions, PrimitiveDynamicInstructions {
     }
 
     func resolve() -> ResolvedDynamicInstructions {
-        ResolvedDynamicInstructions(instructions: nil, tools: [tool])
+        ResolvedDynamicInstructions(instructionTexts: [], tools: [tool])
     }
 }
 
@@ -262,7 +287,7 @@ extension AnyDynamicInstructions: PrimitiveDynamicInstructions {
 extension TupleDynamicInstructions: PrimitiveDynamicInstructions {
     fileprivate func resolve() -> ResolvedDynamicInstructions {
         var result = ResolvedDynamicInstructions.empty
-        repeat result = result.appending(resolveDynamicInstructions(each contents))
+        repeat result.append(resolveDynamicInstructions(each contents))
         return result
     }
 }
@@ -298,15 +323,17 @@ extension EmptyDynamicInstructions: PrimitiveDynamicInstructions {
 
 extension DynamicInstructionsForEach: PrimitiveDynamicInstructions {
     fileprivate func resolve() -> ResolvedDynamicInstructions {
-        data.reduce(into: .empty) { result, element in
-            result = result.appending(resolveDynamicInstructions(content(element)))
+        var result = ResolvedDynamicInstructions.empty
+        for element in data {
+            result.append(resolveDynamicInstructions(content(element)))
         }
+        return result
     }
 }
 
 extension Instructions: PrimitiveDynamicInstructions {
     fileprivate func resolve() -> ResolvedDynamicInstructions {
-        ResolvedDynamicInstructions(instructions: self, tools: [])
+        ResolvedDynamicInstructions(instructionTexts: [description], tools: [])
     }
 }
 
